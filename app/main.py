@@ -6,7 +6,7 @@ from typing import Any
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import service
@@ -16,6 +16,7 @@ from .models import (
     FragmentIn,
     FragmentOut,
     PublicationOut,
+    WithdrawalIn,
 )
 
 
@@ -88,6 +89,34 @@ def list_publications(
     minute_utc: datetime | None = Query(default=None),
 ) -> list[dict[str, Any]]:
     return service.list_publications(station, minute_utc)
+
+
+@app.get("/supply", response_model=list[PublicationOut])
+def current_supply(
+    station: str | None = Query(default=None),
+    minute_utc: datetime | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """What is currently supplied: effective publications only.
+
+    Withdrawn or stale publications never appear here, though they remain
+    fully readable through the publication endpoints.
+    """
+    return service.list_supply(station, minute_utc)
+
+
+@app.post(
+    "/publications/{pub_id}/withdrawal",
+    response_model=PublicationOut,
+)
+def withdraw_publication(pub_id: int, body: WithdrawalIn, http_response: Response) -> dict[str, Any]:
+    """Stop supplying one effective publication (idempotent per id + reason).
+
+    First withdrawal of an id returns 201; repeating the same id with the same
+    reason is an idempotent retry and returns 200 with the original withdrawal.
+    """
+    status_code, result = service.withdraw_publication(pub_id, body.reason)
+    http_response.status_code = status_code
+    return result
 
 
 @app.get("/publications/latest", response_model=PublicationOut)

@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS publications (
     wave             TEXT    NOT NULL,
     fragment_set_hash TEXT   NOT NULL,
     stale            INTEGER NOT NULL DEFAULT 0 CHECK (stale IN (0, 1)),
+    withdrawn        INTEGER NOT NULL DEFAULT 0 CHECK (withdrawn IN (0, 1)),
+    withdrawal_reason TEXT,
+    withdrawn_at     TEXT,
     created_at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -67,12 +70,36 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+# Columns added by the withdrawal feature; an existing volume created by an
+# earlier release does not have them, so they are attached in-place on startup.
+# Each has a safe default meaning "not withdrawn" — every legacy publication
+# therefore stays effective after the upgrade.
+_MIGRATION_COLUMNS = (
+    (
+        "withdrawn",
+        "ALTER TABLE publications ADD COLUMN withdrawn "
+        "INTEGER NOT NULL DEFAULT 0 CHECK (withdrawn IN (0, 1))",
+    ),
+    ("withdrawal_reason", "ALTER TABLE publications ADD COLUMN withdrawal_reason TEXT"),
+    ("withdrawn_at", "ALTER TABLE publications ADD COLUMN withdrawn_at TEXT"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(publications)")}
+    for name, ddl in _MIGRATION_COLUMNS:
+        if name not in existing:
+            conn.execute(ddl)
+            existing.add(name)
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Create the schema if it does not exist yet (safe on every startup)."""
     path = db_path or DB_PATH
     conn = _connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()

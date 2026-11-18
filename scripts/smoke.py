@@ -129,6 +129,91 @@ def main() -> int:
                  params={"station": "NOPE", "minute_utc": MIN})
     check("unknown publication 404", r.status_code == 404)
 
+    # 13. Withdrawal: stop supplying a polluted publication immediately.
+    r = http.post(f"/publications/{pub2['id']}/withdrawal",
+                  json={"reason": "equipment fault"})
+    check("withdraw effective publication", r.status_code == 201)
+    withdrawn = r.json()
+    check("withdrawn flag and reason recorded",
+          withdrawn["withdrawn"] is True
+          and withdrawn["withdrawal_reason"] == "equipment fault"
+          and withdrawn["withdrawn_at"] is not None)
+    check("withdrawn record keeps frozen wave and items",
+          withdrawn["wave"] == pub2["wave"] and len(withdrawn["items"]) == 2)
+
+    # Current supply no longer contains the withdrawn minute, while the
+    # record itself stays readable through the publication endpoints.
+    supply = http.get("/supply",
+                      params={"station": ST, "minute_utc": MIN}).json()
+    check("withdrawn minute absent from supply", supply == [])
+    still = http.get(f"/publications/{pub2['id']}").json()
+    check("withdrawn record still readable",
+          still["withdrawn"] is True
+          and still["withdrawal_reason"] == "equipment fault"
+          and still["wave"] == pub2["wave"])
+
+    # Same id + same reason -> idempotent reuse of the original withdrawal.
+    r = http.post(f"/publications/{pub2['id']}/withdrawal",
+                  json={"reason": "equipment fault"})
+    check("same reason retry idempotent",
+          r.status_code == 200
+          and r.json()["withdrawn_at"] == withdrawn["withdrawn_at"])
+    # Same id + different reason -> refused, original reason untouched.
+    r = http.post(f"/publications/{pub2['id']}/withdrawal",
+                  json={"reason": "another reason"})
+    check("different reason rejected", r.status_code == 409)
+    check("original withdrawal reason preserved",
+          http.get(f"/publications/{pub2['id']}").json()["withdrawal_reason"]
+          == "equipment fault")
+    # Blank/empty reason -> validation error.
+    r = http.post(f"/publications/{pub2['id']}/withdrawal",
+                  json={"reason": "   "})
+    check("blank reason rejected", r.status_code == 422)
+    # Unknown publication -> 404.
+    r = http.post("/publications/999999/withdrawal", json={"reason": "x"})
+    check("withdraw unknown id 404", r.status_code == 404)
+
+    # Re-publishing the identical fragment set cannot restore supply.
+    r = http.post("/publications", params={"station": ST, "minute_utc": MIN})
+    check("republish withdrawn same set refused", r.status_code == 409)
+    check("supply stays empty after refused republish",
+          http.get("/supply", params={"station": ST,
+                                      "minute_utc": MIN}).json() == [])
+
+    # Only a real fragment-set change (higher revision) allows a new
+    # publication, which then resumes supply.
+    http.post("/fragments", json=frag(1, 3, 0, [7] + list(range(1, 30))))
+    r = http.post("/publications", params={"station": ST, "minute_utc": MIN})
+    check("publish after real correction", r.status_code == 201)
+    pub3 = r.json()
+    check("new publication id differs and is effective",
+          pub3["id"] != pub2["id"] and pub3["withdrawn"] is False)
+    supply = http.get("/supply",
+                      params={"station": ST, "minute_utc": MIN}).json()
+    check("supply resumes with corrected record",
+          [p["id"] for p in supply] == [pub3["id"]])
+    # Withdrawn audit trail remains available.
+    audit = http.get(f"/publications/{pub2['id']}").json()
+    check("withdrawn audit record retained",
+          audit["withdrawn"] is True and audit["withdrawal_reason"])
+
+    # 14. A stale publication cannot be withdrawn and never reaches supply.
+    stale_minute = "2026-11-17T08:08:00Z"
+    http.post("/fragments", json=frag(1, 1, 0, list(range(0, 30)),
+                                      station="STALE", minute=stale_minute))
+    http.post("/fragments", json=frag(2, 1, 30, list(range(30, 60)),
+                                      station="STALE", minute=stale_minute))
+    stale_pub = http.post(
+        "/publications", params={"station": "STALE",
+                                 "minute_utc": stale_minute}).json()
+    http.post("/fragments", json=frag(1, 2, 0, [55] + list(range(1, 30)),
+                                      station="STALE", minute=stale_minute))
+    r = http.post(f"/publications/{stale_pub['id']}/withdrawal",
+                  json={"reason": "too late"})
+    check("stale publication cannot be withdrawn", r.status_code == 409)
+    check("stale record absent from supply",
+          http.get("/supply", params={"station": "STALE"}).json() == [])
+
     print()
     if failures:
         print(f"{len(failures)} FAILURE(S): {failures}")

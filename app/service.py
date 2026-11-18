@@ -44,6 +44,18 @@ class NotPublishableError(ServiceError):
     status_code = 409
 
 
+class PublicationNotFoundError(ServiceError):
+    """No publication with the given id."""
+
+    status_code = 404
+
+
+class WithdrawalConflictError(ServiceError):
+    """Withdrawal target is not effective, or a retry carries another reason."""
+
+    status_code = 409
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -296,6 +308,9 @@ def _hydrate_publication(conn: sqlite3.Row, pub: sqlite3.Row) -> dict[str, Any]:
         "minute_utc": _parse_minute(pub["minute_utc"]),
         "wave": load_samples(pub["wave"]),
         "stale": bool(pub["stale"]),
+        "withdrawn": bool(pub["withdrawn"]),
+        "withdrawal_reason": pub["withdrawal_reason"],
+        "withdrawn_at": pub["withdrawn_at"],
         "fragment_set_hash": pub["fragment_set_hash"],
         "created_at": pub["created_at"],
         "items": [
@@ -390,15 +405,27 @@ def publish_minute(station: str, minute_dt: datetime) -> dict[str, Any]:
 
             set_hash = _fragment_set_hash(rows)
 
-            # A fresh publication for this exact fragment set already exists:
-            # return it instead of creating a duplicate.
-            existing = conn.execute(
+            # A publication of this exact fragment set already exists.  Two
+            # cases, both decided on the same committed snapshot:
+            #   * still effective -> idempotent retry, return the same row;
+            #   * withdrawn -> re-publishing the identical set must not bring
+            #     the data back.  Supply resumes only after the set really
+            #     changes (back-fill or a higher revision), which yields a new
+            #     fragment_set_hash and therefore a new publication.
+            prior = conn.execute(
                 "SELECT * FROM publications WHERE station = ? AND minute_utc = ? "
-                "AND fragment_set_hash = ? AND stale = 0 ORDER BY id DESC LIMIT 1",
+                "AND fragment_set_hash = ? ORDER BY id DESC LIMIT 1",
                 (station, minute, set_hash),
             ).fetchone()
-            if existing is not None:
-                result = _hydrate_publication(conn, existing)
+            if prior is not None:
+                if prior["withdrawn"]:
+                    raise NotPublishableError(
+                        "the previous publication of this exact fragment set "
+                        f"(id={prior['id']}) was withdrawn; re-publishing the "
+                        "same fragment set is refused — back-fill missing data "
+                        "or upload a higher revision so the fragment set changes"
+                    )
+                result = _hydrate_publication(conn, prior)
                 conn.commit()
                 return result
 
@@ -440,3 +467,102 @@ def publish_minute(station: str, minute_dt: datetime) -> dict[str, Any]:
         except Exception:
             conn.rollback()
             raise
+
+
+# --------------------------------------------------------------------------- #
+# Withdrawal
+# --------------------------------------------------------------------------- #
+def withdraw_publication(pub_id: int, reason: str) -> tuple[int, dict[str, Any]]:
+    """Withdraw an effective publication and stop supplying its data.
+
+    Retries are idempotent: the same id with the same reason reuse the
+    original withdrawal (same timestamp, HTTP 200).  A different reason on an
+    already withdrawn record is refused (409), as is withdrawing a record that
+    is no longer effective (stale) or missing.
+    """
+    reason = reason.strip()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            pub = conn.execute(
+                "SELECT * FROM publications WHERE id = ?", (pub_id,)
+            ).fetchone()
+            if pub is None:
+                raise PublicationNotFoundError(f"publication {pub_id} not found")
+
+            if pub["withdrawn"]:
+                if pub["withdrawal_reason"] == reason:
+                    # Same id + same reason: idempotent retry of the withdrawal.
+                    result = _hydrate_publication(conn, pub)
+                    conn.commit()
+                    return 200, result
+                raise WithdrawalConflictError(
+                    f"publication {pub_id} was already withdrawn with reason "
+                    f"{pub['withdrawal_reason']!r}; a different reason is not "
+                    "accepted (retry with the original reason)"
+                )
+
+            # Only an effective (non-stale) publication can be withdrawn.
+            # Refresh the stale flag from the current fragment set first so a
+            # concurrent upload cannot leave a stale record marked withdrawn.
+            pub = _refresh_staleness(conn, pub)
+            if pub["stale"]:
+                raise WithdrawalConflictError(
+                    f"publication {pub_id} is stale: its fragment set has "
+                    "changed, withdraw the latest effective publication instead"
+                )
+
+            conn.execute(
+                "UPDATE publications SET withdrawn = 1, withdrawal_reason = ?, "
+                "withdrawn_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+                (reason, pub_id),
+            )
+            pub = conn.execute(
+                "SELECT * FROM publications WHERE id = ?", (pub_id,)
+            ).fetchone()
+            result = _hydrate_publication(conn, pub)
+            conn.commit()
+            return 201, result
+        except Exception:
+            conn.rollback()
+            raise
+
+
+# --------------------------------------------------------------------------- #
+# Current supply
+# --------------------------------------------------------------------------- #
+def list_supply(
+    station: str | None, minute_dt: datetime | None
+) -> list[dict[str, Any]]:
+    """Return the data currently being supplied to downstream consumers.
+
+    Only effective publications participate: stale records (fragment set has
+    moved on) and withdrawn records (supply stopped) are excluded.  The whole
+    read runs on one connection so every returned record reflects the same
+    committed state.
+    """
+    clauses: list[str] = ["stale = 0", "withdrawn = 0"]
+    params: list[Any] = []
+    if station is not None:
+        clauses.append("station = ?")
+        params.append(station)
+    if minute_dt is not None:
+        clauses.append("minute_utc = ?")
+        params.append(minute_key(minute_dt))
+    with get_conn() as conn:
+        pubs = conn.execute(
+            "SELECT * FROM publications WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY id",
+            params,
+        ).fetchall()
+        out = []
+        for pub in pubs:
+            # Self-heal staleness from the current fragment set; a record that
+            # has gone stale since its last read is dropped from the supply.
+            refreshed = _refresh_staleness(conn, pub)
+            if refreshed["stale"] or refreshed["withdrawn"]:
+                continue
+            out.append(_hydrate_publication(conn, refreshed))
+        conn.commit()
+        return out

@@ -67,6 +67,22 @@ WAVEFORM_DB_PATH=./data/waveform.db uvicorn app.main:app --reload
   仍可按 ID 读取，波形与修订保持冻结
 - 每份记录只来自同一个已提交片段集合（事务快照保证）
 
+撤回（withdrawal）与当前供数（supply）：
+
+- 设备故障等情况下，质控员可按 **发布号 + 原因** 撤回一条 **仍有效**（非 stale）的发布，
+  立即停止供数
+- 同号同因重试是幂等的，沿用原撤回（同一 `withdrawn_at`，返回 200）；
+  同号异因拒绝（409），原原因不动；撤回不存在的发布号返回 404，原因为空返回 422
+- 撤回 **不删除数据**：被撤回记录的冻结波形 `wave`、片段来源 `items`、撤回原因
+  `withdrawal_reason` 与时间 `withdrawn_at` 仍可通过发布接口读取
+- 当前供数接口只返回 **既未过期（stale=false）也未撤回（withdrawn=false）** 的发布；
+  被撤回记录不会出现
+- 同一片段集合 **不能靠再次发布恢复供数**：对已撤回的同一 `fragment_set_hash`
+  再次发布返回 409。只有补传缺失片段或上传更高修订 **真正改变片段集合** 后，
+  才能产生新发布并恢复供数
+- 旧 SQLite 卷（无撤回字段的早期版本）启动时自动补列，历史发布默认 `withdrawn=false`，
+  即默认继续供数
+
 ## 三、HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -76,9 +92,33 @@ WAVEFORM_DB_PATH=./data/waveform.db uvicorn app.main:app --reload
 | GET | `/fragments?station=&minute_utc=` | 查看某分钟当前片段 |
 | GET | `/assembly?station=&minute_utc=` | 查看拼装状态：覆盖率、缺口、冲突 |
 | POST | `/publications?station=&minute_utc=` | 发布完整无冲突分钟 |
-| GET | `/publications?station=&minute_utc=` | 发布记录列表（可按台站/分钟过滤） |
+| GET | `/publications?station=&minute_utc=` | 发布记录列表（含已撤回、已过期，可按台站/分钟过滤） |
 | GET | `/publications/latest?station=&minute_utc=` | 该分钟最新一条记录 |
-| GET | `/publications/{id}` | 按 ID 读取（过期记录同样可读） |
+| GET | `/publications/{id}` | 按 ID 读取（过期/撤回记录同样可读） |
+| POST | `/publications/{id}/withdrawal` | 撤回发布：body `{"reason": "..."}`，同号同因幂等、异因 409 |
+| GET | `/supply?station=&minute_utc=` | 当前供数：仅返回未过期且未撤回的有效发布 |
+
+### 撤回与供数示例
+
+```bash
+# 发现已发布分钟受设备故障污染，立即撤回
+curl -s -X POST localhost:8000/publications/1/withdrawal \
+  -H 'content-type: application/json' \
+  -d '{"reason":"station sensor fault, correction pending"}'
+# -> 201，记录带 withdrawn=true、withdrawal_reason、withdrawn_at
+
+# 同号同因重试：幂等，沿用原撤回（200，withdrawn_at 不变）
+curl -s -X POST localhost:8000/publications/1/withdrawal \
+  -H 'content-type: application/json' \
+  -d '{"reason":"station sensor fault, correction pending"}'
+# 同号异因：409，原撤回原因保留
+
+# 当前供数不再包含它（但 /publications/1 仍可读到波形、片段来源与原因）
+curl -s "localhost:8000/supply?station=STA1&minute_utc=$MIN"
+
+# 同一集合再次发布被拒（409）；补传/更高修订真正改变集合后才能重新发布
+curl -s -X POST "localhost:8000/publications?station=STA1&minute_utc=$MIN"
+```
 
 ### 典型流程
 
@@ -102,12 +142,13 @@ curl -s -X POST "localhost:8000/publications?station=STA1&minute_utc=$MIN"
 
 ```bash
 pip install pytest httpx
-python -m pytest tests/ -v          # 22 个用例：校验/修订/拼装/发布/过期/重启/并发
-python scripts/smoke.py             # 对运行中的服务做 32 项端到端检查
+python -m pytest tests/ -v          # 37 个用例：校验/修订/拼装/发布/过期/撤回/供数/迁移/重启/并发
+python scripts/smoke.py             # 对运行中的服务做 48 项端到端检查
 ```
 
-并发用例会启动真实 uvicorn 进程，用 6 个线程同时上传并尝试发布，
-断言中间态发布只可能干净失败（409），完成态恰好产生一条完整记录，无半份数据。
+并发用例会启动真实 uvicorn 进程，用多个线程同时上传并尝试发布/撤回，
+断言中间态操作只可能干净失败（409）或幂等返回，完成态恰好产生一条完整记录，
+无半份数据、无重复撤回。
 
 ## 五、目录结构
 
@@ -116,7 +157,7 @@ app/
   config.py      # 环境变量配置（WAVEFORM_DB_PATH）
   database.py    # SQLite 连接与建表
   models.py      # Pydantic 请求/响应模型
-  service.py     # 事务、拼装算法、发布与过期逻辑
+  service.py     # 事务、拼装算法、发布、过期、撤回与供数逻辑
   main.py        # FastAPI 路由
 tests/test_api.py
 scripts/smoke.py

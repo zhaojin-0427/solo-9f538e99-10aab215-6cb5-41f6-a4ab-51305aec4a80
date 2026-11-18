@@ -64,12 +64,26 @@ class PublicationItemOut(BaseModel):
     content_hash: str
 
 
+class WithdrawalIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=512)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("withdrawal reason must not be blank")
+        return v.strip()
+
+
 class PublicationOut(BaseModel):
     id: int
     station: str
     minute_utc: datetime
     wave: list[int]
     stale: bool
+    withdrawn: bool = False
+    withdrawal_reason: str | None = None
+    withdrawn_at: str | None = None
     fragment_set_hash: str
     created_at: str
     items: list[PublicationItemOut]
